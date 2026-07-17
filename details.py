@@ -3,6 +3,8 @@ import numpy as np
 import torch.nn.functional as F
 import torch
 import torch.nn as nn
+from PIL.ImageFilter import Kernel
+
 
 # def compute_conv(X, Weight, x, y, c2, Sx, Sy):
 #
@@ -17,71 +19,50 @@ import torch.nn as nn
 #     return y
 
 
-def compute_conv_pixel(X, Weight, x, y, c2, Sx, Sy):
+def compute_conv2d(X, Weight, stride, pad):
     """
-    计算单通道 c2，当前空间坐标 (x, y) 的卷积结果
-    X 形状: (B, C_in, H, W)
-    Weight 形状: (C_out, C_in, Kh, Kw)
+    纯数学嵌套循环实现的标准 2D 卷积
+    X: (B, C_in, H_in, W_in)
+    Weight: (C_out, C_in, Kh, Kw)
+    stride: 步长 (假设高宽步长一致)
+    pad: 填充大小
     """
-    # 1. 计算感受野切片坐标（已经做过物理 pad，不要减 1）
-    start_h = x * Sx
-    end_h = start_h + Weight.shape[2]  # Kh
+    B, C_in, H_in, W_in = X.shape
+    C_out, C_in_w, Kh, Kw = Weight.shape
 
-    start_w = y * Sy
-    # 修复你原代码中统一用 Sy 的问题：高用 Sx（步长x），宽用 Sy（步长y）
-    end_w = start_w + Weight.shape[3]  # Kw
+    assert C_in == C_in_w, "输入通道数必须与权重的输入通道数一致"
 
-    # 2. 核心：切片提取局部窗口 (Patch)
-    # 形状为: (B, C_in, Kh, Kw)
-    patch = X[:, :, start_h:end_h, start_w:end_w]
+    # 1. 计算普通卷积的理论输出尺寸
+    H_out = (H_in + 2 * pad - Kh) // stride + 1
+    W_out = (W_in + 2 * pad - Kw) // stride + 1
 
-    # 3. 取出对应的卷积核权重
-    # Weight[c2] 的形状是 (C_in, Kh, Kw)
-    # 加上 [None, ...] 变成 (1, C_in, Kh, Kw)，方便与具有 Batch 维度的 patch 进行广播乘法
-    kernel = Weight[None, c2, :, :, :]
+    # 初始化输出张量
+    Y_manual = torch.zeros((B, C_out, H_out, W_out), device=X.device)
 
-    # 4. 逐元素相乘并求和
-    # patch * kernel 形状仍为 (B, C_in, Kh, Kw)
-    # 为了保留 Batch 维度（即 Y_out[:, c2, x, y] 需要接收一个长度为 B 的向量）
-    # 我们只对通道维和空间维求和（dim=[1, 2, 3]），保留第 0 维 (Batch)
-    # print("patch.shape", patch.shape)
-    # print("kernel.shape", kernel.shape)
-    out_val = torch.sum(patch * kernel, dim=[0,1, 2, 3])
+    # 2. 对应论文中的多重求和公式：
+    # Y[b, co, i, j] = sum_{ci} sum_{m} sum_{n} X[b, ci, x, y] * W[co, ci, m, n]
+    for b in range(B):  # 1. 遍历 Batch 维度
+        for co in range(C_out):  # 2. 遍历输出通道 C_out
+            for i in range(H_out):  # 3. 遍历输出空间行 H_out
+                for j in range(W_out):  # 4. 遍历输出空间列 W_out
+                    val = 0.0
 
-    return out_val
+                    for ci in range(C_in):  # 5. 遍历输入通道 C_in
+                        for m in range(Kh):  # 6. 遍历卷积核高 Kh
+                            for n in range(Kw):  # 7. 遍历卷积核宽 Kw
 
-def compute_conv_all(X_tilde, W_tilde, Sx, Sy, pad, T):
-    # 1. 获取未 Padding 前的原始尺寸
-    B, C_in, H_in, W_in = X_tilde.shape
-    C_out, C_in_w, Kh, Kw = W_tilde.shape
+                                # 核心：将输出坐标 (i, j) 配合卷积核内的偏移量 (m, n) 映射回输入张量上的坐标 (x, y)
+                                x = i * stride - pad + m
+                                y = j * stride - pad + n
 
-    assert C_in == C_in_w, "输入张量的通道数必须与权重的输入通道数一致"
+                                # 虚拟 Padding 约束：判定映射回的 x, y 是否落在原始有效输入范围内
+                                # 如果越界（<0 或 >=H_in/W_in），相当于乘了 Padding 的 0，因此只累加有效范围
+                                if 0 <= x < H_in and 0 <= y < W_in:
+                                    val += X[b, ci, x, y] * Weight[co, ci, m, n]
 
-    # 2. 根据是卷积还是反卷积，计算不同的输出尺寸
-    if T<1:
-        # 反卷积 (Transposed Convolution) 尺寸公式
-        # 假设 dilation=1, output_padding=0
-        H_out = (H_in - 1) * Sx - 2 * pad + Kh
-        W_out = (W_in - 1) * Sy - 2 * pad + Kw
-    else:
-        # 普通卷积 (Convolution) 尺寸公式
-        H_out = (H_in + 2 * pad - Kh) // Sx + 1
-        W_out = (W_in + 2 * pad - Kw) // Sy + 1
+                    Y_manual[b, co, i, j] = val
 
-    # 3. 执行物理 Padding
-    # 对于 BCHW，(pad, pad, pad, pad) 正好填充最后两个空间维度 H 和 W
-    X_padded = F.pad(X_tilde, (pad, pad, pad, pad))
-
-    # 输出形状为 (B, C_out, H_out, W_out)
-    Y_out = torch.zeros((B, C_out, H_out, W_out), device=X_tilde.device)
-
-    for x in range(H_out):
-        for y in range(W_out):
-            for c2 in range(C_out):
-                # 注意：传入的是经过 pad 处理后的 X_padded
-                Y_out[:, c2, x, y] = compute_conv_pixel(X_padded, W_tilde, x, y, c2, Sx, Sy)
-
-    return Y_out
+    return Y_manual
 def sample_X(X,Tx,Ty):
 
     B,C_in,H,W=X.shape
@@ -109,15 +90,46 @@ def sample_X(X,Tx,Ty):
 def proc_W(Weight, Tx, Ty):
     if Tx<1 and Ty<1:
         # W_tilde = torch.rot90(Weight, k=2, dims=[2, 3])# W 180翻转
-        # W_tilde=torch.transpose(Weight,2,3)#[H,W,Cout,Cin]
+        # W_tilde=torch.transpose(Weight,2,3)#[H,W,C_out,C_in]
         W_tilde=Weight
     else:
         W_tilde=Weight
     return W_tilde
 
-def unified_conv(X, W, Tx=1.0, Ty=1.0, Sx=1, Sy=1, pad=0):
-    """统一调度接口"""
-    X_tilde = sample_X(X, Tx, Ty)
-    W_tilde = proc_W(W, Tx, Ty)
-    print("W_tilde.shape", W_tilde.shape)
-    return compute_conv_all(X_tilde, W_tilde, Sx=Sx, Sy=Sy, pad=pad,T=Tx)
+# def unified_conv(X, W, Tx=1.0, Ty=1.0, Sx=1, Sy=1, pad=0):
+#     """统一调度接口"""
+#     X_tilde = sample_X(X, Tx, Ty)
+#     W_tilde = proc_W(W, Tx, Ty)
+#     print("W_tilde.shape", W_tilde.shape)
+#     return compute_conv_all(X_tilde, W_tilde, Sx=Sx, Sy=Sy, pad=pad,T=Tx)
+
+def compute_transconv(X,Weight,stride):
+    B, C_in, H_in, W_in = X.shape
+    C_in, C_out, Kh, Kw = Weight.shape
+    # 计算理论输出尺寸
+    hout = (H_in - 1) * stride + Kh
+    wout = (W_in - 1) * stride + Kw
+
+    # 初始化输出张量
+    Y_manual = torch.zeros((1, C_out, hout, wout))
+
+    # 对应论文中的多重求和公式：
+    # Y[co, i, j] = sum_{ci} sum_{x in Omega_x} sum_{y in Omega_y} X[ci, x, y] * W[ci, co, m, n]
+    for co in range(C_out):  # 遍历输出通道 C_out
+        for i in range(hout):  # 遍历输出空间行 H_out
+            for j in range(wout):  # 遍历输出空间列 W_out
+                val = 0.0
+                for ci in range(C_in):  # 遍历输入通道 C_in (公式中的第一个求和符号)
+                    for x in range(H_in):  # 遍历输入空间行 H_in (公式中的第二个求和符号)
+                        for y in range(W_in):  # 遍历输入空间列 W_in (公式中的第三个求和符号)
+
+                            # 计算当前输入 (x, y) 投射到输出 (i, j) 时，对应的卷积核内部索引 (m, n)
+                            m = i  - x * stride
+                            n = j  - y * stride
+
+                            # 严格对应约束条件：0 <= m < K_H 且 0 <= n < K_W (即判定 x, y 是否在 Omega 集合中)
+                            if 0 <= m < Kh and 0 <= n < Kw:
+                                val += X[0, ci, x, y] * Weight[ci, co, m, n]
+
+                Y_manual[0, co, i, j] = val
+    return Y_manual
